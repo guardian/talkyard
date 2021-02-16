@@ -1,16 +1,12 @@
 import {
-  GuArnParameter,
+  GuParameter,
   GuStack,
   GuStackProps,
+  GuSubnetListParameter,
 } from "@guardian/cdk/lib/constructs/core";
-import { App, Duration } from "@aws-cdk/core";
+import { App } from "@aws-cdk/core";
 import { GuSecurityGroup, GuVpc } from "@guardian/cdk/lib/constructs/ec2";
 import { GuInstanceRole } from "@guardian/cdk/lib/constructs/iam";
-import { GuApplicationTargetGroup } from "@guardian/cdk/lib/constructs/loadbalancing";
-import {
-  ApplicationProtocol,
-  TargetType,
-} from "@aws-cdk/aws-elasticloadbalancingv2";
 import { transformToCidrIngress } from "@guardian/cdk/lib/utils";
 import {
   Instance,
@@ -18,90 +14,86 @@ import {
   InstanceSize,
   InstanceType,
   MachineImage,
-  Peer,
-  Port,
+  Subnet,
   UserData,
 } from "@aws-cdk/aws-ec2";
 import { GuardianNetworks } from "@guardian/private-infrastructure-config";
 
-const uid = (resource: string): string => `talkyard-${resource}`;
-
 export class TalkyardStack extends GuStack {
   constructor(scope: App, id: string, props: GuStackProps) {
     super(scope, id, props);
+    const uid = (resource: string): string => `${this.app}-${resource}`;
 
-    // The code that defines your stack goes here
-    const secrets = {};
     const parameters = {
-      TLSCert: new GuArnParameter(this, uid("TLSCert"), {
-        description: "ARN of a TLS certificate to install on the load balancer",
+      subnets: new GuSubnetListParameter(this, uid("subnets-param"), {
+        description: "The subnets where Talkyard instances will run",
+      }),
+      subnet: new GuParameter(this, uid("subnet-param"), {
+        type: "<AWS::EC2::Subnet::Id>",
+        description: "The subnet where Talkyard instances will run",
       }),
     };
-    const serverPort = 3000; // TODO: Establish correct port for server
 
     const vpc = GuVpc.fromIdParameter(this, "vpc");
-    const subnets = GuVpc.subnetsfromParameter(this);
+    const subnet = Subnet.fromSubnetAttributes(this, uid("subnet"), {
+      subnetId: parameters.subnet.valueAsString,
+      availabilityZone: this.availabilityZones[0],
+    });
+    // const subnets = GuVpc.subnets(this, parameters.subnets.valueAsList);
+    // const serverPort = 80; // TODO: Establish correct port for server
 
     const talkyardRole = new GuInstanceRole(this, uid("instance-role"), {
       withoutLogShipping: true,
     });
 
-    // TODO: Identify what the health check will be for this
-    const targetGroup = new GuApplicationTargetGroup(
-      this,
-      "TalkyardInternalTargetGroup",
-      {
-        vpc: vpc,
-        port: serverPort,
-        protocol: ApplicationProtocol.HTTP,
-        targetType: TargetType.INSTANCE,
-        healthCheck: {
-          port: serverPort.toString(),
-          path: "/api/health",
-          interval: Duration.minutes(1),
-          timeout: Duration.seconds(3),
-        },
-        deregistrationDelay: Duration.seconds(30),
-        overrideId: true,
-      }
-    );
-
-    // TODO: Does the egress rule need to be anyIpv4?
-    const loadBalancerSecurityGroup = new GuSecurityGroup(
-      this,
-      uid("lb-security-group"),
-      {
-        description:
-          "Guardian IP range has access to the load balancer on port 80",
-        vpc: vpc,
-        allowAllOutbound: false,
-        overrideId: true,
-        ingresses: transformToCidrIngress(Object.entries(GuardianNetworks)),
-        egresses: [{ range: Peer.anyIpv4(), port: Port.tcp(serverPort) }],
-      }
-    );
-
     const appSecurityGroup = new GuSecurityGroup(
       this,
       uid("app-security-group"),
-      { description: "HTTP", vpc, allowAllOutbound: false, overrideId: true }
+      {
+        description: "HTTP",
+        vpc,
+        allowAllOutbound: true,
+        overrideId: true,
+        ingresses: transformToCidrIngress(Object.entries(GuardianNetworks)),
+      }
     );
 
     // TODO: Fill this in correctly from: https://github.com/debiki/talkyard-prod-one
     const userData = UserData.custom(`#!/bin/bash -ev
+    
+apt-get update
+apt-get -y install git vim locales
+locale-gen en_US.UTF-8                      # installs English
+export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8  # starts using English (warnings are harmless)
+cd /opt/
+git clone https://github.com/debiki/talkyard-prod-one.git talkyard
+cd talkyard
+./scripts/prepare-ubuntu.sh 2>&1 | tee -a talkyard-maint.log
+./scripts/install-docker-compose.sh 2>&1 | tee -a talkyard-maint.log
+./scripts/start-firewall.sh 2>&1 | tee -a talkyard-maint.log
 
-          aws s3 cp s3://deploy-tools-dist/deploy/${this.stage}/talkyard/talkyard.zip /tmp/talkyard.zip
-          cd /
-          unzip -o /tmp/talkyard.zip
+aws s3 cp s3://deploy-tools-dist/${this.stack}/${this.stage}/${this.app}/play-framework.conf /opt/talkyard/conf/play-framework.conf
+aws s3 cp s3://deploy-tools-dist/${this.stack}/${this.stage}/${this.app}/.env                /opt/talkyard/.env
+              
+cp mem/2g.yml docker-compose.override.yml
+./scripts/upgrade-if-needed.sh 2>&1 | tee -a talkyard-maint.log
+./scripts/schedule-logrotate.sh 2>&1 | tee -a talkyard-maint.log
+./scripts/schedule-daily-backups.sh 2>&1 | tee -a talkyard-maint.log
+./scripts/schedule-automatic-upgrades.sh 2>&1 | tee -a talkyard-maint.log
 
 `);
 
-    const ec2Instance = new Instance(this, uid("instance"), {
+    new Instance(this, uid("instance"), {
       vpc,
       userData,
       instanceType: InstanceType.of(InstanceClass.M3, InstanceSize.MEDIUM),
-      machineImage: MachineImage.lookup({ name: "sortThis" }), // TODO: Work this out
+      machineImage: MachineImage.latestAmazonLinux(), // TODO: Work this out
       securityGroup: appSecurityGroup,
+      role: talkyardRole,
+      vpcSubnets: {
+        subnets: [subnet],
+        // availabilityZones: this.availabilityZones,
+      },
     });
   }
 }

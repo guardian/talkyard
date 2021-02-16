@@ -57,3 +57,8 @@ dist
 .yarn/unplugged
 .yarn/build-state.yml
 .pnp.*
+
+.env
+play-framework.conf
+
+.DS_Store
